@@ -18,11 +18,13 @@ import collections
 import dataclasses
 import json
 import logging
+import math
 import os
 import threading
 import time
 import traceback
 import typing as t
+import uuid
 from urllib.parse import urlparse, parse_qsl
 
 import firebase_admin
@@ -30,6 +32,8 @@ from apache_beam.io.gcp import gcsio
 from firebase_admin import firestore
 from google.cloud.firestore_v1 import DocumentReference
 from google.cloud.firestore_v1.types import WriteResult
+from google.cloud import storage
+
 
 """An implementation-dependent Manifest URI."""
 Location = t.NewType('Location', str)
@@ -174,6 +178,7 @@ class Manifest(abc.ABC):
             download_duration=int(end - self.start)
         )
         self._update(self.status)
+        self._close()
 
     def transact(self, selection: t.Dict, location: str, user: str) -> 'Manifest':
         """Create a download transaction."""
@@ -182,6 +187,10 @@ class Manifest(abc.ABC):
 
     @abc.abstractmethod
     def _update(self, download_status: DownloadStatus) -> None:
+        pass
+
+    @abc.abstractmethod
+    def _close(self):
         pass
 
 
@@ -196,13 +205,80 @@ class GCSManifest(Manifest):
     # (i.e. JSON manifests).
     _lock = threading.Lock()
 
+    def __post_init__(self):
+        super().__post_init__()
+        self.files = collections.deque()
+
     def _update(self, download_status: DownloadStatus) -> None:
         """Writes the JSON data to a manifest."""
         with GCSManifest._lock:
-            with gcsio.GcsIO().open(self.location, 'a') as gcs_file:
+            # GCS does not support appending, so each write will create
+            # a separate file, all of which will be merged upon closure
+            file_path = self.location + ".part." + \
+                        str(int(time.time() * 10**6)) \
+                        + str(uuid.uuid4())[-4:]
+
+            # keep file path to merge the files in the end
+            self.files.append(urlparse(file_path).path)
+
+            # write file part
+            with gcsio.GcsIO().open(file_path, 'w') as gcs_file:
                 json.dump(download_status._asdict(), gcs_file)
+
         logger.debug('Manifest written to.')
         logger.debug(download_status)
+
+    def _file_batches(self, size) -> t.List[t.Iterable[str]]:
+        """Return batch of given size from files"""
+        return [self.files[i * size:(i + 1) * size] for i in
+                range(math.ceil(len(self.files) / size))]
+
+    def _flatten(self, bucket, target):
+        """
+        merge the file parts into a single file, 32 parts at a time per
+        GCS requirements
+        :param bucket:
+        :param target: path to final output file
+        :return:
+        """
+
+        # keep merging the files until none of them left
+        while len(self.files) > 1:
+
+            # this merging round's output files
+            out_files = collections.deque()
+
+            # flatten the logs in one file
+            for i, batch in enumerate(self._file_batches(32)):
+
+                # generate and store temporary file name
+                dest_path = f"{target}_{i}_{uuid.uuid4()}"
+                destination = bucket.blob(dest_path)
+                out_files.append(dest_path)
+
+                # write batch
+                blob_batch = [bucket.get_blob(urlparse(f).path) for f in batch]
+                destination.compose(blob_batch)
+
+                # remove original files
+                for blob in blob_batch:
+                    blob.delete()
+
+            # update files
+            self.files = out_files
+
+        # rename the file to target location
+        bucket.rename_blob(bucket.blob(self.files[0]), target)
+        return
+
+    def _close(self):
+
+        cli = storage.Client()
+        bucket = cli.bucket(urlparse(self.location).netloc)
+        target = urlparse(self.location).path
+
+        if len(self.files) > 0:
+            self._flatten(bucket, target)
 
 
 class LocalManifest(Manifest):
