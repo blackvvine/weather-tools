@@ -29,6 +29,8 @@ import firebase_admin
 from firebase_admin import firestore
 from google.cloud.firestore_v1 import DocumentReference
 from google.cloud.firestore_v1.types import WriteResult
+import google.cloud.logging
+
 
 """An implementation-dependent Manifest URI."""
 Location = t.NewType('Location', str)
@@ -344,6 +346,17 @@ class FirestoreManifest(Manifest):
         return {'collection': parsed.netloc, **query_params}
 
 
+class StackdriverManifest(Manifest):
+
+    def __post_init__(self):
+        super().__post_init__()
+
+    def _update(self, download_status: DownloadStatus) -> None:
+        client = google.cloud.logging.Client()
+        sd_logger = client.logger('weatherdl_manifest')
+        sd_logger.log_struct(download_status._asdict())
+
+
 """Exposed manifest implementations.
 
 Users can choose their preferred manifest implementation by via the protocol of the Manifest Location.
@@ -354,6 +367,7 @@ If no key is found, the `NoOpManifest` option will be chosen. See `parsers:parse
 """
 MANIFESTS = collections.OrderedDict({
     'fs': FirestoreManifest,
+    'stackdriver': StackdriverManifest,
     '': LocalManifest,
 })
 

@@ -39,8 +39,9 @@ base_requirements = [
     "xarray",
     "requests>=2.24.0",
     "firebase-admin>=5.0.0",
-    "urllib3==1.26.5",
     "google-cloud-firestore==2.6.0",
+    "google-cloud-logging==3.1.2",
+    "urllib3==1.26.5",
 ]
 
 setup(
